@@ -61,7 +61,6 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
         insight_save_path: If set, collect attention insight data for the first block
                            and save to this path (e.g. "insight_data.pt").
     '''  
-    insight_save_path = None  
     # print(steps, block_length)
     prompt_len = prompt.shape[1]
     x = torch.full((1, prompt_len + gen_length), mask_id, dtype=torch.long).to(model.device)

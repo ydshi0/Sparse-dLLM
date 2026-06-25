@@ -369,6 +369,26 @@ class ModelConfig():
     kernel_size: Optional[int] = 3
     keep_ratio: float = 0.5
 
+    ## [PyramidKV] cache eviction allocation strategy
+    ## "uniform"  = original Sparse-dLLM (same keep_ratio for all layers)
+    ## "pyramid"  = PyramidKV linear arithmetic decay (static, no extra computation)
+    ## "adaptive" = entropy-based adaptive allocation (dynamic, collects attention entropy at step 1)
+    allocation_strategy: str = "uniform"
+    ## pyramid_beta: steepness of pyramid / adaptive ratio range
+    ## For "pyramid": beta=2 → gentle (L0=0.75, L_top=0.25), beta=4 → steep (L0=0.875, L_top=0.125)
+    ## For "adaptive": same beta determines the [min_ratio, max_ratio] range for entropy mapping
+    pyramid_beta: float = 2.0
+
+    ## [PyramidKV-Adaptive] ratio range and metric (only used when allocation_strategy="adaptive")
+    ## Each layer's metric is linearly mapped to [adaptive_min_ratio, adaptive_max_ratio].
+    ## Default: None → auto-set to [keep_ratio - 0.1, keep_ratio + 0.1], e.g. [0.4, 0.6]
+    adaptive_min_ratio: Optional[float] = None
+    adaptive_max_ratio: Optional[float] = None
+    ## adaptive_metric: which metric to use for layer-adaptive ratio allocation
+    ##   "gini"    (recommended) high Gini (concentrated) → low ratio; directly measures top-k effectiveness
+    ##   "entropy" high entropy (dispersed) → high ratio; based on softmax attention distribution
+    adaptive_metric: str = "gini"
+
     @property
     def effective_n_kv_heads(self) -> int:
         if self.n_kv_heads is None:

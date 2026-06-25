@@ -540,17 +540,11 @@ class CustomCache:
     """
     def __init__(self, n_layers: int, device: torch.device, kernel_size: Optional[int] = None, keep_ratio: float = 0.7,
                  allocation_strategy: str = "uniform", pyramid_beta: float = 2.0,
-                 adaptive_min_ratio: Optional[float] = None, adaptive_max_ratio: Optional[float] = None,
-                 adaptive_metric: str = "gini"):
+                 adaptive_min_ratio: Optional[float] = None, adaptive_max_ratio: Optional[float] = None):
         self.cache = {}
         self.n_layers = n_layers
         self.allocation_strategy = allocation_strategy
         self.pool_kernel_size = kernel_size
-        self.base_keep_ratio = keep_ratio
-
-        ## [Insight] data collection flag — set to True externally to enable
-        self.collect_insight = False
-        self.insight_data = {}   # layer_id -> dict of collected tensors
 
         ## [PyramidKV] per-layer keep_ratio allocation
         if allocation_strategy == "pyramid":
@@ -558,14 +552,14 @@ class CustomCache:
         elif allocation_strategy == "adaptive":
             # Placeholder; actual ratios computed by apply_adaptive_filter() after step 1
             self.keep_ratios = [keep_ratio for i in range(n_layers)]
+            # Adaptive ratio range: entropy will be linearly mapped to [min_ratio, max_ratio]
+            # Default: keep_ratio ± 0.1, e.g. keep_ratio=0.5 → [0.4, 0.6]
             self.adaptive_min_ratio = adaptive_min_ratio if adaptive_min_ratio is not None else keep_ratio - 0.1
             self.adaptive_max_ratio = adaptive_max_ratio if adaptive_max_ratio is not None else keep_ratio + 0.1
             self.adaptive_min_ratio = max(0.01, self.adaptive_min_ratio)
             self.adaptive_max_ratio = min(1.0, self.adaptive_max_ratio)
-            self.adaptive_metric = adaptive_metric  # "entropy" or "gini"
             self.pending_filter = {}   # layer_id -> (filtered_k, filtered_v, importance)
             self.entropies = {}        # layer_id -> entropy scalar
-            self.ginis = {}            # layer_id -> gini scalar
         else:
             # "uniform": original Sparse-dLLM
             self.keep_ratios = [keep_ratio for i in range(n_layers)]
@@ -609,45 +603,24 @@ class CustomCache:
         return ratios
 
     # ------------------------------------------------------------------ #
-    #  Gini coefficient on importance scores
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _compute_gini(values: torch.Tensor) -> float:
-        """
-        Gini coefficient of importance scores. 
-        0 = perfectly uniform, 1 = maximally concentrated (one token has all mass).
-        
-        High Gini → few pivotal tokens dominate → can aggressively evict → LOW keep_ratio.
-        Low Gini  → importance spread evenly   → need more cache      → HIGH keep_ratio.
-        """
-        values = torch.abs(values).flatten()
-        sorted_vals, _ = torch.sort(values)
-        n = len(sorted_vals)
-        if n == 0:
-            return 0.0
-        total = sorted_vals.sum()
-        if total == 0:
-            return 0.0
-        index = torch.arange(1, n + 1, device=values.device, dtype=values.dtype)
-        gini = (2.0 * (index * sorted_vals).sum() / (n * total)) - (n + 1.0) / n
-        return gini.item()
-
-    # ------------------------------------------------------------------ #
     #  Adaptive: deferred batch filter (called after step 1 forward pass)
     # ------------------------------------------------------------------ #
     def apply_adaptive_filter(self):
         """
-        Batch-apply adaptive cache eviction for ALL layers.
+        Batch-apply entropy-adaptive cache eviction for ALL layers.
         
-        Supports two metrics (controlled by self.adaptive_metric):
-          - "entropy": high entropy (dispersed) → HIGH ratio (keep more)
-          - "gini":    high Gini (concentrated) → LOW ratio (keep fewer)
+        Called once after step 1 (cache_state=1) forward pass completes.
+        At that point every layer has deposited its (filtered_k, filtered_v,
+        importance, entropy) into self.pending_filter / self.entropies.
         
         Procedure:
-          1. Collect per-layer metric values (entropy or gini).
-          2. Normalize to [0, 1].
-          3. Map to [min_ratio, max_ratio] with correct direction.
-          4. Per-layer top-k.
+          1. Normalize entropies across layers to [0, 1].
+          2. Linearly map to [adaptive_min_ratio, adaptive_max_ratio].
+             Higher entropy → higher ratio (dispersed attention, keep more).
+          3. Per-layer top-k on the already-computed importance scores.
+          4. Write final filtered KV into self.cache[layer_id].
+        
+        After this call, cache_state=2 steps will retrieve the filtered cache.
         """
         if self.allocation_strategy != "adaptive":
             return
@@ -655,47 +628,29 @@ class CustomCache:
             return
 
         layer_ids = sorted(self.pending_filter.keys())
-        
-        # Select metric and mapping direction
-        if self.adaptive_metric == "gini":
-            metric_vals = [self.ginis.get(i, 0) for i in layer_ids]
-            invert = True   # high Gini → LOW ratio
-        else:
-            metric_vals = [self.entropies.get(i, 0) for i in layer_ids]
-            invert = False  # high entropy → HIGH ratio
-        
-        m_min, m_max = min(metric_vals), max(metric_vals)
+        entropies = [self.entropies[i] for i in layer_ids]
+        e_min, e_max = min(entropies), max(entropies)
 
         for layer_id in layer_ids:
             fk, fv, importance = self.pending_filter[layer_id]
-            
-            if self.adaptive_metric == "gini":
-                m = self.ginis.get(layer_id, 0)
-            else:
-                m = self.entropies.get(layer_id, 0)
+            e = self.entropies[layer_id]
 
-            # Normalize to [0, 1]
-            if m_max > m_min:
-                norm_m = (m - m_min) / (m_max - m_min)
+            # Entropy → normalized [0, 1] → linear map to [min_ratio, max_ratio]
+            if e_max > e_min:
+                norm_e = (e - e_min) / (e_max - e_min)
             else:
-                norm_m = 0.5
-            
-            # Map to ratio: invert direction for Gini
-            if invert:
-                # High Gini → low ratio (concentrated → evict more)
-                adaptive_ratio = self.adaptive_max_ratio - norm_m * (self.adaptive_max_ratio - self.adaptive_min_ratio)
-            else:
-                # High entropy → high ratio (dispersed → keep more)
-                adaptive_ratio = self.adaptive_min_ratio + norm_m * (self.adaptive_max_ratio - self.adaptive_min_ratio)
-
+                norm_e = 0.5
+            adaptive_ratio = self.adaptive_min_ratio + norm_e * (self.adaptive_max_ratio - self.adaptive_min_ratio)
+            print(f"Layer {layer_id}: entropy={e:.2f}, norm_e={norm_e:.2f}, adaptive_ratio={adaptive_ratio:.2f}")
             self.keep_ratios[layer_id] = adaptive_ratio
-            print(f"Layer {layer_id}: metric={m:.2f}, norm={norm_m:.2f}, adaptive_ratio={adaptive_ratio:.2f}")
+
             total_len = fk.size(2)
             keep_num = max(1, int(total_len * adaptive_ratio))
             device = fk.device
 
             _, keep_indices = torch.topk(importance, k=keep_num, dim=-1)
-            keep_indices, _ = torch.sort(keep_indices.squeeze(0))
+            # keep_indices = keep_indices.squeeze(0)
+            keep_indices, _ = torch.sort(keep_indices.squeeze(0))  # 按位置排序，保持RoPE一致
 
             n_kv_heads = fk.size(1)
             idx = torch.arange(n_kv_heads, device=device)[:, None]
@@ -722,7 +677,7 @@ class CustomCache:
         """
         Dynamic bidirectional cache eviction for one layer.
         
-        For "uniform" / "pyramid": immediate top-k with pre-determined keep_ratio.
+        For "uniform" / "pyramid": immediately does top-k with pre-determined keep_ratio.
         For "adaptive": computes entropy, stores pending data, defers top-k to 
                         apply_adaptive_filter() which runs after all layers complete.
         """
@@ -730,11 +685,13 @@ class CustomCache:
         cached_k = cached["k"]
         cached_v = cached["v"]
 
+        # q_block: [B, n_heads, block_len, head_dim]
+        # cached_k: [B, n_kv_heads, seq_len, head_dim]
         # Extract KV states outside the current block (prefix + suffix)
         filtered_cached_k = torch.cat([cached_k[:, :, :cur_filtered_len, :], cached_k[:, :, cur_filtered_len + block_len:, :]], dim = 2)
         filtered_cached_v = torch.cat([cached_v[:, :, :cur_filtered_len, :], cached_v[:, :, cur_filtered_len + block_len:, :]], dim = 2)
 
-        # Handle GQA
+        # Handle GQA: expand KV heads to match query heads for score computation
         if q_block.size(1) != filtered_cached_k.size(1):
             filtered_cached_k_attn = filtered_cached_k.repeat_interleave(
                 q_block.size(1) // filtered_cached_k.size(1), dim=1
@@ -745,10 +702,10 @@ class CustomCache:
         # Compute attention-based importance scores
         avg_q = q_block.mean(dim=-2)                # [B, n_heads, head_dim]
         scores = torch.matmul(avg_q.unsqueeze(-2), filtered_cached_k_attn.transpose(-2, -1)).squeeze(-2)
-        head_dim = avg_q.size(-1)
 
-        ## [PyramidKV-Adaptive] scaled scores → entropy + gini + importance, then defer top-k
+        ## [PyramidKV-Adaptive] scaled scores → entropy + importance, then defer top-k
         if self.allocation_strategy == "adaptive":
+            head_dim = avg_q.size(-1)
             raw_scores = scores / math.sqrt(head_dim)                  # [B, n_heads, seq_len]
 
             # Entropy from per-head softmax distribution
@@ -757,13 +714,8 @@ class CustomCache:
                         .sum(dim=-1).mean().item()
             self.entropies[layer_id] = entropy
 
-            # Importance from scaled scores
+            # Importance from scaled scores (same scale as entropy)
             importance = raw_scores.mean(dim=1)                        # [B, seq_len]
-
-            # Gini coefficient on importance scores (BEFORE pooling)
-            # Measures concentration: high Gini = few tokens dominate = can evict more
-            self.ginis[layer_id] = self._compute_gini(importance[0])
-
             if self.pool_kernel_size is not None:
                 importance = F.max_pool1d(
                     importance.unsqueeze(1),
@@ -772,10 +724,6 @@ class CustomCache:
                     padding=self.pool_kernel_size // 2
                 ).squeeze(1)
 
-            ## [Insight] collect per-layer data
-            if self.collect_insight:
-                self._collect_filter_insight(layer_id, attn_probs, importance, entropy)
-
             # Store pending; actual top-k deferred to apply_adaptive_filter()
             self.pending_filter[layer_id] = (filtered_cached_k, filtered_cached_v, importance)
             return
@@ -783,14 +731,7 @@ class CustomCache:
         # Non-adaptive path (uniform / pyramid): immediate top-k
         importance = scores.mean(dim=1)  # [B, seq_len_outside_block]
 
-        ## [Insight] also collect data for uniform/pyramid
-        if self.collect_insight:
-            raw_scores = scores / math.sqrt(head_dim)
-            attn_probs = F.softmax(raw_scores, dim=-1)
-            entropy = -(attn_probs * (attn_probs + 1e-9).log()) \
-                        .sum(dim=-1).mean().item()
-            self._collect_filter_insight(layer_id, attn_probs, importance, entropy)
-
+        # Non-adaptive path: immediate top-k filtering (uniform / pyramid)
         if self.pool_kernel_size is not None:
             importance = F.max_pool1d(
                 importance.unsqueeze(1),
@@ -800,7 +741,7 @@ class CustomCache:
             ).squeeze(1)
         
         keep_num = int(importance.size(-1) * self.keep_ratios[layer_id])
-        keep_num = max(1, keep_num)
+        keep_num = max(1, keep_num)  ## [PyramidKV] safety: keep at least 1 token
         _, keep_indices = torch.topk(importance, k=keep_num, dim=-1)
         keep_indices = keep_indices.squeeze(0)
         
@@ -811,96 +752,12 @@ class CustomCache:
             "k": filtered_cached_k,
             "v": filtered_cached_v
         }
-
-    # ------------------------------------------------------------------ #
-    #  Insight data collection (only active when collect_insight=True)
-    # ------------------------------------------------------------------ #
-    def _collect_filter_insight(self, layer_id: int, attn_probs: torch.Tensor,
-                                importance: torch.Tensor, entropy: float):
-        """
-        Collect per-layer attention statistics during filter_cache.
-        
-        Saved data per layer:
-          - attn_probs: [n_heads, seq_len] softmax attention from block queries to non-block keys
-          - importance: [seq_len] head-averaged importance scores (for top-k selection)
-          - entropy: scalar Shannon entropy
-        """
-        if layer_id not in self.insight_data:
-            self.insight_data[layer_id] = {}
-        self.insight_data[layer_id]['attn_probs'] = attn_probs[0].detach().cpu().half()  # [n_heads, seq_len]
-        self.insight_data[layer_id]['importance'] = importance[0].detach().cpu().float()  # [seq_len]
-        self.insight_data[layer_id]['entropy'] = entropy
-        self.insight_data[layer_id]['gini'] = self.ginis.get(layer_id, self._compute_gini(importance[0]))
-
-    def collect_attention_heatmap(self, layer_id: int, q: torch.Tensor, k: torch.Tensor):
-        """
-        Collect full-sequence attention heatmap Q·K^T at cache_state=1.
-        
-        Called from the attention method BEFORE cache logic, when Q and K span
-        the entire sequence. Result is a head-averaged [seq_len, seq_len] matrix.
-        
-        Args:
-            layer_id: Current layer index.
-            q: [B, n_heads, seq_len, head_dim] after RoPE.
-            k: [B, n_kv_heads, seq_len, head_dim] after RoPE.
-        """
-        if not self.collect_insight:
-            return
-        with torch.no_grad():
-            # Handle GQA
-            if q.size(1) != k.size(1):
-                k_exp = k.repeat_interleave(q.size(1) // k.size(1), dim=1)
-            else:
-                k_exp = k
-            d_k = q.size(-1)
-            # [B, n_heads, seq_len, seq_len]
-            attn_weights = F.softmax(
-                torch.matmul(q, k_exp.transpose(-2, -1)) / math.sqrt(d_k),
-                dim=-1
-            )
-            # Average over batch and heads → [seq_len, seq_len]
-            heatmap = attn_weights.mean(dim=(0, 1)).cpu().float()
-        if layer_id not in self.insight_data:
-            self.insight_data[layer_id] = {}
-        self.insight_data[layer_id]['heatmap'] = heatmap
-
-    def save_insight_data(self, save_path: str):
-        """
-        Save all collected insight data to a .pt file.
-        
-        Saved structure:
-        {
-            'n_layers': int,
-            'keep_ratios': list,       # final per-layer keep ratios used
-            'allocation_strategy': str,
-            'base_keep_ratio': float,
-            'layers': {
-                0: { 'heatmap': Tensor[S,S], 'attn_probs': Tensor[H,L], 
-                     'importance': Tensor[L], 'entropy': float },
-                1: { ... },
-                ...
-            }
-        }
-        """
-        import os
-        save_dict = {
-            'n_layers': self.n_layers,
-            'keep_ratios': self.keep_ratios,
-            'allocation_strategy': self.allocation_strategy,
-            'base_keep_ratio': self.base_keep_ratio,
-            'layers': self.insight_data,
-        }
-        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
-        torch.save(save_dict, save_path)
-        print(f"[Insight] Saved to {save_path}, layers={len(self.insight_data)}")
-    
         
     def clear(self):
         self.cache.clear()
         if self.allocation_strategy == "adaptive":
             self.pending_filter.clear()
             self.entropies.clear()
-            self.ginis.clear()
 
 
 class LLaDABlock(nn.Module):
@@ -1091,8 +948,6 @@ class LLaDABlock(nn.Module):
 
         ## Cache
         if cache_state == 1:
-            ## [Insight] collect full attention heatmap before cache operations
-            customcache.collect_attention_heatmap(self.layer_id, q, k)
             customcache.update_cache(self.layer_id, k, v)
             customcache.filter_cache(self.layer_id, q[:, :, position_offset: position_offset + self.config.block_len, :], position_offset, self.config.block_len)
         elif cache_state == 2:

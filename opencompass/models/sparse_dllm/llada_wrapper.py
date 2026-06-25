@@ -126,6 +126,14 @@ class Sparse_dLLM_LLaDACausalLM(HuggingFaceBaseModel):
                  kernel_size: Optional[int] = None,
                  keep_ratio: float = 0.5,
 
+                 ## [PyramidKV] allocation strategy parameters
+                 ## "uniform" = original Sparse-dLLM, "pyramid" = PyramidKV, "adaptive" = metric-based
+                 allocation_strategy: str = "uniform",
+                 pyramid_beta: float = 2.0,
+                 adaptive_min_ratio: Optional[float] = None,
+                 adaptive_max_ratio: Optional[float] = None,
+                 adaptive_metric: str = "gini",
+
                  **other_kwargs):
 
         if seed is not None:
@@ -151,6 +159,12 @@ class Sparse_dLLM_LLaDACausalLM(HuggingFaceBaseModel):
         
         self.keep_ratio = keep_ratio
         self.kernel_size = kernel_size
+        ## [PyramidKV] store allocation strategy parameters
+        self.allocation_strategy = allocation_strategy
+        self.pyramid_beta = pyramid_beta
+        self.adaptive_min_ratio = adaptive_min_ratio
+        self.adaptive_max_ratio = adaptive_max_ratio
+        self.adaptive_metric = adaptive_metric
 
         if model_type == 'dream':
             self.diffusion_config = {'steps': 32, 'alg': 'origin', 'output_history': True, 'return_dict_in_generate': True, }
@@ -188,6 +202,12 @@ class Sparse_dLLM_LLaDACausalLM(HuggingFaceBaseModel):
         config.block_len = self.block_len
         config.kernel_size = self.kernel_size
         config.keep_ratio = self.keep_ratio
+        ## [PyramidKV] pass allocation strategy to config
+        config.allocation_strategy = self.allocation_strategy
+        config.pyramid_beta = self.pyramid_beta
+        config.adaptive_min_ratio = self.adaptive_min_ratio
+        config.adaptive_max_ratio = self.adaptive_max_ratio
+        config.adaptive_metric = self.adaptive_metric
 
         if self.scaling_config is not None:
             scaling_factor = self.scaling_config['scaling_factor'] if 'scaling_factor' in self.scaling_config else 1
